@@ -413,12 +413,11 @@ def get_columns(filters):
 
 def get_stock_ledger_entries(filters, items):
     sle = frappe.qb.DocType("Stock Ledger Entry")
-    b = frappe.qb.DocType("Batch")  # 👈 NEW
+    b = frappe.qb.DocType("Batch")
 
     query = (
         frappe.qb.from_(sle)
-        .left_join(b)                     # 👈 NEW
-        .on(b.name == sle.batch_no)       # 👈 NEW
+        .left_join(b).on(b.name == sle.batch_no)
         .select(
             sle.item_code,
             sle.posting_datetime.as_("date"),
@@ -438,7 +437,7 @@ def get_stock_ledger_entries(filters, items):
             sle.batch_no,
             sle.serial_no,
             sle.project,
-            b.batch_id.as_("batch_id"),   # 👈 NEW: select custom Batch ID
+            b.batch_id.as_("batch_id"),
         )
         .where(
             (sle.docstatus < 2)
@@ -449,6 +448,7 @@ def get_stock_ledger_entries(filters, items):
         .orderby(sle.creation)
     )
 
+    # inventory dimensions
     inventory_dimension_fields = get_inventory_dimension_fields()
     if inventory_dimension_fields:
         for fieldname in inventory_dimension_fields:
@@ -456,26 +456,47 @@ def get_stock_ledger_entries(filters, items):
             if fieldname in filters and filters.get(fieldname):
                 query = query.where(sle[fieldname].isin(filters.get(fieldname)))
 
+    # item filter
     if items:
         query = query.where(sle.item_code.isin(items))
 
+    # simple equality filters
     for field in ["voucher_no", "project", "company"]:
         if filters.get(field) and field not in inventory_dimension_fields:
             query = query.where(sle[field] == filters.get(field))
 
+    # -------- Batch filters (OUTSIDE the for-loop above) --------
+
+        # If user typed in Batch No field, accept either an exact Batch name
+    # OR a partial match on Batch.batch_id, plus bundles that contain such batches.
     if filters.get("batch_no"):
-        bundles = get_serial_and_batch_bundles(filters)
-        if bundles:
+        bundles_exact = get_serial_and_batch_bundles(filters)
+        bundles_by_id_like = get_bundles_for_batch_id_like(filters.batch_no)
+
+        batch_no_or_id = (sle.batch_no == filters.batch_no) | (
+            b.batch_id.like(f"%{filters.batch_no}%")
+        )
+
+        if bundles_exact or bundles_by_id_like:
             query = query.where(
-                (sle.serial_and_batch_bundle.isin(bundles)) | (sle.batch_no == filters.batch_no)
+                (sle.serial_and_batch_bundle.isin(bundles_exact + bundles_by_id_like))
+                | batch_no_or_id
             )
         else:
-            query = query.where(sle.batch_no == filters.batch_no)
+            query = query.where(batch_no_or_id)
 
-    # 👇 NEW: filter by Batch ID (partial match)
+    # Dedicated Batch ID filter (partial match) with bundle support
     if filters.get("batch_id"):
-        query = query.where(b.batch_id.like(f"%{filters.batch_id}%"))
+        bundles_by_id_like = get_bundles_for_batch_id_like(filters.batch_id)
+        if bundles_by_id_like:
+            query = query.where(
+                (b.batch_id.like(f"%{filters.batch_id}%"))
+                | (sle.serial_and_batch_bundle.isin(bundles_by_id_like))
+            )
+        else:
+            query = query.where(b.batch_id.like(f"%{filters.batch_id}%"))
 
+    # warehouse filter
     query = apply_warehouse_filter(query, sle, filters)
 
     return query.run(as_dict=True)
@@ -500,6 +521,38 @@ def get_serial_and_batch_bundles(filters):
 	)
 
 	return query.run(pluck=SBE.parent)
+
+
+def get_bundles_for_batch_id_like(term: str) -> list[str]:
+    """Return SBB names where any SBE.batch_no belongs to a Batch with batch_id LIKE %term%."""
+    if not term:
+        return []
+    B = frappe.qb.DocType("Batch")
+    SBE = frappe.qb.DocType("Serial and Batch Entry")
+    SBB = frappe.qb.DocType("Serial and Batch Bundle")
+
+    batch_names = (
+        frappe.qb.from_(B)
+        .select(B.name)
+        .where(B.batch_id.like(f"%{term}%"))
+    ).run(pluck=B.name)
+
+    if not batch_names:
+        return []
+
+    return (
+        frappe.qb.from_(SBE)
+        .inner_join(SBB).on(SBE.parent == SBB.name)
+        .select(SBE.parent)
+        .where(
+            (SBB.docstatus == 1)
+            & (SBB.has_batch_no == 1)
+            & (SBB.voucher_no.notnull())
+            & (SBE.batch_no.isin(batch_names))
+        )
+    ).run(pluck=SBE.parent)
+
+
 
 
 def get_inventory_dimension_fields():
